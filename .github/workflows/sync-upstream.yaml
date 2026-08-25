@@ -1,0 +1,205 @@
+name: Sync fork with upstream
+
+# Keeps this fork in step with Baseflow/flutter-geolocator:
+#
+#   main    - untouched mirror of upstream, fast-forwarded only
+#   fdroid  - main + the "no Google Play Services" patch, rebased onto upstream
+#
+# The rebase is only pushed if the patch still holds (no gms references come
+# back) and the plugin still compiles. On conflict or breakage nothing is
+# pushed and an issue is opened instead.
+#
+# NOTE: `fdroid` must be this repository's default branch, otherwise GitHub
+# will neither run the schedule below nor offer the manual trigger.
+
+on:
+  schedule:
+    # Mondays, 04:17 UTC. Upstream releases a few times a year, so weekly is
+    # plenty; the job exits early when upstream has not moved.
+    - cron: "17 4 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  issues: write
+
+concurrency:
+  group: sync-upstream
+  cancel-in-progress: false
+
+env:
+  UPSTREAM_REPO: https://github.com/Baseflow/flutter-geolocator.git
+  UPSTREAM_BRANCH: main
+  MIRROR_BRANCH: main
+  PATCH_BRANCH: fdroid
+
+jobs:
+  sync:
+    name: Rebase patch branch onto upstream
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout patch branch
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ env.PATCH_BRANCH }}
+          fetch-depth: 0
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream
+        run: |
+          git remote add upstream "$UPSTREAM_REPO"
+          git fetch --no-tags upstream "$UPSTREAM_BRANCH"
+
+      - name: Check whether upstream moved
+        id: check
+        run: |
+          before="$(git rev-parse HEAD)"
+          upstream="$(git rev-parse "upstream/$UPSTREAM_BRANCH")"
+          echo "before=$before" >> "$GITHUB_OUTPUT"
+          echo "upstream=$upstream" >> "$GITHUB_OUTPUT"
+
+          if [ "$(git merge-base HEAD "$upstream")" = "$upstream" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Already rebased onto $upstream - nothing to do."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "New upstream commits:"
+            git log --oneline "HEAD..$upstream" | head -50
+          fi
+
+      - name: Rebase onto upstream
+        id: rebase
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          if ! git rebase "upstream/$UPSTREAM_BRANCH"; then
+            echo "Rebase hit a conflict, aborting."
+            git rebase --abort || true
+            exit 1
+          fi
+
+      - name: Verify the patch still holds
+        id: verify
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          fail=0
+
+          if grep -rn 'com\.google\.android\.gms' geolocator_android/android/build.gradle; then
+            echo "::error::play-services-location is back in geolocator_android/android/build.gradle"
+            fail=1
+          fi
+
+          if grep -rn 'com\.google\.android\.gms' geolocator_android/android/src; then
+            echo "::error::Google Play Services is referenced from the Android sources again"
+            fail=1
+          fi
+
+          fused="geolocator_android/android/src/main/java/com/baseflow/geolocator/location/FusedLocationClient.java"
+          if [ -e "$fused" ]; then
+            echo "::error::$fused was reintroduced by the rebase"
+            fail=1
+          fi
+
+          if [ "$fail" -eq 0 ]; then
+            echo "No Google Play Services references remain."
+          fi
+          exit "$fail"
+
+      - name: Set up Java
+        if: steps.check.outputs.changed == 'true'
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Flutter
+        if: steps.check.outputs.changed == 'true'
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+
+      - name: Build the example app
+        id: build
+        if: steps.check.outputs.changed == 'true'
+        # Compiles the patched Java, so a rebase that leaves the plugin in a
+        # broken state never reaches the branch FOSS Warn pins.
+        run: flutter build apk --release
+        working-directory: ./geolocator_android/example
+
+      - name: Push
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          git push --force-with-lease="refs/heads/$PATCH_BRANCH:${{ steps.check.outputs.before }}" \
+            origin "HEAD:refs/heads/$PATCH_BRANCH"
+          # The mirror only ever fast-forwards; a failure here means someone
+          # committed to it directly, which is worth surfacing.
+          git push origin "upstream/$UPSTREAM_BRANCH:refs/heads/$MIRROR_BRANCH"
+
+      - name: Summary
+        if: steps.check.outputs.changed == 'true'
+        run: |
+          {
+            echo "### Rebased \`$PATCH_BRANCH\` onto upstream"
+            echo
+            echo "- upstream: \`${{ steps.check.outputs.upstream }}\`"
+            echo "- \`$PATCH_BRANCH\`: \`${{ steps.check.outputs.before }}\` -> \`$(git rev-parse HEAD)\`"
+            echo
+            echo "Update the pinned commit in FOSS Warn's \`pubspec.yaml\` to pick this up."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Open an issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if [ "${{ steps.rebase.outcome }}" = "failure" ]; then
+            reason="the rebase onto upstream hit a conflict"
+          elif [ "${{ steps.verify.outcome }}" = "failure" ]; then
+            reason="the rebase succeeded but Google Play Services references came back"
+          elif [ "${{ steps.build.outcome }}" = "failure" ]; then
+            reason="the rebase succeeded but the plugin no longer compiles"
+          else
+            reason="the sync job failed"
+          fi
+
+          body="$(cat <<EOF
+          Automated sync of \`$PATCH_BRANCH\` onto \`upstream/$UPSTREAM_BRANCH\`
+          (\`${{ steps.check.outputs.upstream }}\`) failed: $reason.
+
+          Nothing was pushed. To resolve it by hand:
+
+          \`\`\`bash
+          git fetch upstream
+          git checkout $PATCH_BRANCH
+          git rebase upstream/$UPSTREAM_BRANCH
+          \`\`\`
+
+          The two conflicts to expect:
+
+          - \`FusedLocationClient.java\` - modify/delete. Keep it deleted: \`git rm <path>\`.
+          - \`geolocator_android/android/build.gradle\` - keep upstream's dependency
+            bumps but drop the \`com.google.android.gms:play-services-location\` line.
+
+          Then \`git push --force-with-lease\`.
+
+          [Failed run](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          EOF
+          )"
+
+          gh label create upstream-sync \
+            --color B60205 \
+            --description "Automated upstream rebase needs attention" 2>/dev/null || true
+
+          existing="$(gh issue list --label upstream-sync --state open --limit 1 --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --body "$body"
+          else
+            gh issue create \
+              --title "Upstream sync failed" \
+              --label upstream-sync \
+              --body "$body"
+          fi
